@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Barn Ratter</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; background: #2b1d12; overflow: hidden;
+    font-family: 'Trebuchet MS', Verdana, sans-serif; color: #fff5e1;
+    height: 100%; display: flex; align-items: center; justify-content: center;
+  }
+  #gameWrap { position: relative; box-shadow: 0 0 40px rgba(0,0,0,0.6); }
+  canvas { display: block; background: #5a3d24; image-rendering: pixelated; }
+  #overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(20, 12, 6, 0.88); text-align: center;
+  }
+  #overlay.hidden { display: none; }
+  #overlay h1 { font-size: 48px; margin: 0 0 10px; color: #ffcf6e; text-shadow: 2px 2px #000; }
+  #overlay p { max-width: 480px; line-height: 1.5; font-size: 16px; }
+  #overlay button {
+    margin-top: 18px; padding: 12px 28px; font-size: 18px; cursor: pointer;
+    background: #b5482b; color: #fff5e1; border: 3px solid #ffcf6e; border-radius: 8px;
+    font-weight: bold; letter-spacing: 1px;
+  }
+  #overlay button:hover { background: #d35a38; }
+  .stat { font-size: 20px; margin: 4px 0; }
+  .stat b { color: #ffcf6e; }
+</style>
+</head>
+<body>
+<div id="gameWrap">
+  <canvas id="game" width="800" height="600"></canvas>
+  <div id="overlay">
+    <h1>🐾 Barn Ratter 🐾</h1>
+    <p id="overlayText">
+      You are a Wire Fox Terrier on rat patrol! Explore the barn, sniff out every rat,
+      and catch them all before time runs out.<br><br>
+      <b>WASD / Arrow Keys</b> to move. Bump into rats to catch them (+100).<br>
+      <b>Avoid rabbits</b> — catching one costs you points (-150) and slows you down!
+    </p>
+    <button id="startBtn">Start Game</button>
+  </div>
+</div>
+<script>
+/* =========================================================
+   BARN RATTER - single-file canvas game
+   Sections: Utility, Input, Obstacle, Entity/Dog/Rat/Rabbit,
+             FX (floating text / particles), Audio, HUD, Game
+   ========================================================= */
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+const overlayText = document.getElementById('overlayText');
+const startBtn = document.getElementById('startBtn');
+
+const VIEW_W = canvas.width;
+const VIEW_H = canvas.height;
+const WORLD_W = 1600;
+const WORLD_H = 1200;
+
+// ---------- Pixelation pipeline ----------
+// The world is rendered into a small offscreen canvas, then scaled up with
+// smoothing disabled so every shape resolves into chunky, retro pixels.
+const PIXEL_SCALE = 3;
+const pixelCanvas = document.createElement('canvas');
+pixelCanvas.width = Math.round(VIEW_W / PIXEL_SCALE);
+pixelCanvas.height = Math.round(VIEW_H / PIXEL_SCALE);
+const pixelCtx = pixelCanvas.getContext('2d');
+pixelCtx.imageSmoothingEnabled = false;
+ctx.imageSmoothingEnabled = false;
+
+// ---------- Utility ----------
+function rand(min, max) { return Math.random() * (max - min) + min; }
+function randInt(min, max) { return Math.floor(rand(min, max + 1)); }
+function dist(ax, ay, bx, by) { return Math.hypot(ax - bx, ay - by); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ---------- Audio (Web Audio API, no external files) ----------
+const AudioFX = {
+  ctx: null,
+  init() {
+    if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+  },
+  tone(freq, dur, type, vol, glideTo) {
+    this.init();
+    const ctx = this.ctx;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type || 'sine';
+    osc.frequency.setValueAtTime(freq, ctx.currentTime);
+    if (glideTo) osc.frequency.exponentialRampToValueAtTime(glideTo, ctx.currentTime + dur);
+    gain.gain.setValueAtTime(vol || 0.2, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + dur);
+  },
+  yip() { this.tone(900, 0.12, 'triangle', 0.25, 1400); },
+  bark() {
+    // two quick descending square-wave blips to read as a terrier "woof-woof"
+    this.tone(420, 0.09, 'square', 0.28, 180);
+    setTimeout(() => this.tone(380, 0.1, 'square', 0.26, 150), 90);
+  },
+  whine() { this.tone(500, 0.45, 'sawtooth', 0.2, 220); },
+  win() { this.tone(660, 0.5, 'sine', 0.25, 990); },
+  lose() { this.tone(300, 0.6, 'sawtooth', 0.2, 120); }
+};
+
+// ---------- Input ----------
+const Keys = {};
+window.addEventListener('keydown', e => { Keys[e.key.toLowerCase()] = true; });
+window.addEventListener('keyup', e => { Keys[e.key.toLowerCase()] = false; });
+
+function inputVector() {
+  let dx = 0, dy = 0;
+  if (Keys['arrowleft'] || Keys['a']) dx -= 1;
+  if (Keys['arrowright'] || Keys['d']) dx += 1;
+  if (Keys['arrowup'] || Keys['w']) dy -= 1;
+  if (Keys['arrowdown'] || Keys['s']) dy += 1;
+  if (dx !== 0 && dy !== 0) { dx *= 0.7071; dy *= 0.7071; }
+  return { dx, dy };
+}
+
+// ---------- Obstacle ----------
+class Obstacle {
+  constructor(x, y, w, h, type) {
+    this.x = x; this.y = y; this.w = w; this.h = h; this.type = type; // 'hay' | 'crate' | 'fence' | 'stall'
+  }
+  intersects(x, y, r) {
+    // circle vs rect collision
+    const closestX = clamp(x, this.x, this.x + this.w);
+    const closestY = clamp(y, this.y, this.y + this.h);
+    return dist(x, y, closestX, closestY) < r;
+  }
+  draw(ctx) {
+    const { x, y, w, h, type } = this;
+    if (type === 'hay') {
+      ctx.fillStyle = '#d8b85a';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#a8862f';
+      ctx.lineWidth = 3;
+      for (let i = 8; i < w; i += 14) {
+        ctx.beginPath(); ctx.moveTo(x + i, y + 4); ctx.lineTo(x + i, y + h - 4); ctx.stroke();
+      }
+      ctx.strokeRect(x, y, w, h);
+    } else if (type === 'crate') {
+      ctx.fillStyle = '#8a5a32';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#5c3a1e';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(x + 3, y + 3, w - 6, h - 6);
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + w, y + h); ctx.moveTo(x + w, y); ctx.lineTo(x, y + h); ctx.stroke();
+    } else if (type === 'fence') {
+      ctx.fillStyle = '#6b4326';
+      ctx.fillRect(x, y, w, h);
+      ctx.fillStyle = '#8a5a32';
+      const postW = 6;
+      for (let i = 0; i < w; i += 18) ctx.fillRect(x + i, y, postW, h);
+    } else if (type === 'stall') {
+      ctx.fillStyle = '#7a4a26';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#3e2510';
+      ctx.lineWidth = 4;
+      ctx.strokeRect(x, y, w, h);
+      ctx.fillStyle = '#3e2510';
+      ctx.fillRect(x + w / 2 - 4, y, 8, h);
+    }
+  }
+}
+
+// ---------- Floating text / particle FX ----------
+class FloatText {
+  constructor(x, y, text, color) {
+    this.x = x; this.y = y; this.text = text; this.color = color;
+    this.life = 1.0; this.vy = -40;
+  }
+  update(dt) {
+    this.y += this.vy * dt;
+    this.life -= dt * 0.9;
+  }
+  draw(ctx, camX, camY) {
+    ctx.save();
+    ctx.globalAlpha = clamp(this.life, 0, 1);
+    ctx.fillStyle = this.color;
+    ctx.font = 'bold 22px Trebuchet MS';
+    ctx.textAlign = 'center';
+    ctx.fillText(this.text, this.x - camX, this.y - camY);
+    ctx.restore();
+  }
+}
+
+// ---------- Base moving entity ----------
+class Entity {
+  constructor(x, y, r) {
+    this.x = x; this.y = y; this.r = r;
+    this.facing = { x: 0, y: 1 };
+  }
+  tryMove(nx, ny, obstacles) {
+    // resolve per-axis to allow sliding along obstacles
+    if (!this.collidesAt(nx, this.y, obstacles)) this.x = nx;
+    if (!this.collidesAt(this.x, ny, obstacles)) this.y = ny;
+    this.x = clamp(this.x, this.r, WORLD_W - this.r);
+    this.y = clamp(this.y, this.r, WORLD_H - this.r);
+  }
+  collidesAt(x, y, obstacles) {
+    for (const o of obstacles) if (o.intersects(x, y, this.r)) return true;
+    return false;
+  }
+}
+
+// ---------- Dog (player) ----------
+class Dog extends Entity {
+  constructor(x, y) {
+    super(x, y, 16);
+    this.baseSpeed = 220;
+    this.slowTimer = 0;
+    this.whineTimer = 0;
+    this.animT = 0;
+    this.moving = false;
+  }
+  get speed() { return this.slowTimer > 0 ? this.baseSpeed * 0.45 : this.baseSpeed; }
+  applyPenalty() {
+    this.slowTimer = 1.5;
+    this.whineTimer = 0.6;
+  }
+  update(dt, obstacles) {
+    const { dx, dy } = inputVector();
+    this.moving = dx !== 0 || dy !== 0;
+    if (this.moving) {
+      this.facing = { x: dx, y: dy };
+      this.tryMove(this.x + dx * this.speed * dt, this.y + dy * this.speed * dt, obstacles);
+    }
+    if (this.slowTimer > 0) this.slowTimer -= dt;
+    if (this.whineTimer > 0) this.whineTimer -= dt;
+    this.animT += dt * (this.moving ? 10 : 3);
+  }
+  draw(ctx, camX, camY) {
+    const sx = this.x - camX, sy = this.y - camY;
+    ctx.save();
+    ctx.translate(sx, sy);
+    const angle = Math.atan2(this.facing.y, this.facing.x);
+    ctx.rotate(angle + Math.PI / 2);
+
+    // squash/stretch while moving; shake while whining
+    let scaleX = 1, scaleY = 1;
+    if (this.moving) {
+      scaleY = 1 + Math.sin(this.animT) * 0.06;
+      scaleX = 1 - Math.sin(this.animT) * 0.06;
+    }
+    if (this.whineTimer > 0) {
+      ctx.translate(rand(-3, 3), rand(-3, 3));
+    }
+    ctx.scale(scaleX, scaleY);
+
+    // legs (short, peeking past the body so the dog reads as low-slung)
+    ctx.fillStyle = '#e8ddc8';
+    const legPhase = this.moving ? Math.sin(this.animT) : 0;
+    ctx.fillRect(-11, 10 + legPhase * 2, 4, 9);
+    ctx.fillRect(7, 10 - legPhase * 2, 4, 9);
+    ctx.fillRect(-9, -2 - legPhase * 2, 4, 9);
+    ctx.fillRect(5, -2 + legPhase * 2, 4, 9);
+
+    // body - white wiry coat
+    ctx.fillStyle = '#f4ead8';
+    ctx.beginPath();
+    ctx.ellipse(0, 2, 12, 16, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // black saddle patch across the back (classic wire fox terrier marking)
+    ctx.fillStyle = '#2c2620';
+    ctx.beginPath();
+    ctx.ellipse(0, -1, 8, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // tan trim around the saddle
+    ctx.fillStyle = '#c98a44';
+    ctx.beginPath();
+    ctx.ellipse(-8, -9, 5, 6, 0.4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(8, -9, 5, 6, -0.4, 0, Math.PI * 2);
+    ctx.fill();
+
+    // wiry fur texture flecks
+    ctx.strokeStyle = 'rgba(60,50,40,0.35)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 10; i++) {
+      const fx = rand(-9, 9), fy = rand(-12, 10);
+      ctx.beginPath();
+      ctx.moveTo(fx, fy);
+      ctx.lineTo(fx + rand(-1.5, 1.5), fy + rand(2, 4));
+      ctx.stroke();
+    }
+
+    // head - tan
+    ctx.fillStyle = '#c98a44';
+    ctx.beginPath();
+    ctx.ellipse(0, -17, 8, 8, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // muzzle / snout, elongated like a terrier
+    ctx.fillStyle = '#fdf6e8';
+    ctx.beginPath();
+    ctx.ellipse(0, -10, 4.5, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // wiry beard tuft on chin
+    ctx.fillStyle = '#fdf6e8';
+    ctx.beginPath();
+    ctx.moveTo(-3, -7); ctx.lineTo(0, -2); ctx.lineTo(3, -7);
+    ctx.closePath();
+    ctx.fill();
+    // nose
+    ctx.fillStyle = '#1c140d';
+    ctx.beginPath();
+    ctx.ellipse(0, -7.5, 2, 1.6, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // folded-forward ears (v-shaped, tan)
+    ctx.fillStyle = '#a8703a';
+    ctx.beginPath(); ctx.moveTo(-7, -22); ctx.lineTo(-10, -13); ctx.lineTo(-3, -18); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(7, -22); ctx.lineTo(10, -13); ctx.lineTo(3, -18); ctx.closePath(); ctx.fill();
+
+    // bushy eyebrows (terrier signature look)
+    ctx.strokeStyle = '#fdf6e8';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(-6, -20); ctx.lineTo(-2.5, -19); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(6, -20); ctx.lineTo(2.5, -19); ctx.stroke();
+
+    // eyes
+    ctx.fillStyle = '#1c140d';
+    ctx.beginPath(); ctx.arc(-3.2, -18, 1.3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(3.2, -18, 1.3, 0, Math.PI * 2); ctx.fill();
+
+    // short docked tail standing upright, wagging when idle
+    const wag = this.moving ? Math.sin(this.animT) * 0.15 : Math.sin(this.animT * 2) * 0.6;
+    ctx.strokeStyle = '#f4ead8';
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(0, 14);
+    ctx.lineTo(Math.sin(wag) * 6, 4 + Math.cos(wag) * 2);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+}
+
+// ---------- Rat ----------
+class Rat extends Entity {
+  constructor(x, y, isBig) {
+    super(x, y, isBig ? 13 : 9);
+    this.isBig = !!isBig;
+    this.speed = this.isBig ? rand(110, 145) : rand(70, 100);
+    this.fleeing = false;
+    this.fleeDir = { x: 0, y: 0 };
+    this.wiggle = rand(0, Math.PI * 2);
+  }
+  update(dt, dog, obstacles) {
+    const d = dist(this.x, this.y, dog.x, dog.y);
+    if (d < 110) {
+      this.fleeing = true;
+      this.fleeDir = { x: (this.x - dog.x) / (d || 1), y: (this.y - dog.y) / (d || 1) };
+    }
+    if (this.fleeing) {
+      this.tryMove(this.x + this.fleeDir.x * this.speed * dt, this.y + this.fleeDir.y * this.speed * dt, obstacles);
+      this.facing = this.fleeDir;
+      if (d > 220) this.fleeing = false;
+    }
+    this.wiggle += dt * 14;
+  }
+  draw(ctx, camX, camY) {
+    const sx = this.x - camX, sy = this.y - camY;
+    ctx.save();
+    ctx.translate(sx, sy);
+    const angle = Math.atan2(this.facing.y || 1, this.facing.x || 0);
+    ctx.rotate(angle + Math.PI / 2);
+    const s = this.isBig ? 1.5 : 1;
+    ctx.scale(s, s);
+    const bodyColor = this.isBig ? '#5c4738' : '#7d6655';
+    // tail
+    ctx.strokeStyle = '#7a5b48';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, 9);
+    ctx.quadraticCurveTo(Math.sin(this.wiggle) * 6, 16, Math.sin(this.wiggle) * 3, 22);
+    ctx.stroke();
+    // body
+    ctx.fillStyle = bodyColor;
+    ctx.beginPath();
+    ctx.ellipse(0, 2, 7, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // head
+    ctx.beginPath();
+    ctx.ellipse(0, -8, 5, 5, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // ears
+    ctx.fillStyle = '#5c4a3d';
+    ctx.beginPath(); ctx.arc(-4, -10, 2.4, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(4, -10, 2.4, 0, Math.PI * 2); ctx.fill();
+    // eye
+    ctx.fillStyle = '#1a1a1a';
+    ctx.beginPath(); ctx.arc(0, -9, 1, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ---------- Rabbit ----------
+class Rabbit extends Entity {
+  constructor(x, y) {
+    super(x, y, 11);
+    this.speed = rand(130, 170);
+    this.fleeing = false;
+    this.fleeDir = { x: 0, y: 0 };
+    this.fleeTimer = 0;
+    this.hopT = rand(0, Math.PI * 2);
+    this.wanderTimer = 0;
+    this.wanderDir = { x: 0, y: 0 };
+  }
+  update(dt, dog, obstacles) {
+    const d = dist(this.x, this.y, dog.x, dog.y);
+    if (d < 150) {
+      this.fleeing = true;
+      this.fleeTimer = 1.2;
+      const jitter = rand(-0.4, 0.4);
+      const baseAngle = Math.atan2(this.y - dog.y, this.x - dog.x) + jitter;
+      this.fleeDir = { x: Math.cos(baseAngle), y: Math.sin(baseAngle) };
+    }
+    if (this.fleeing) {
+      this.tryMove(this.x + this.fleeDir.x * this.speed * dt, this.y + this.fleeDir.y * this.speed * dt, obstacles);
+      this.facing = this.fleeDir;
+      this.fleeTimer -= dt;
+      if (this.fleeTimer <= 0 && d > 260) this.fleeing = false;
+    } else {
+      // erratic wander
+      this.wanderTimer -= dt;
+      if (this.wanderTimer <= 0) {
+        this.wanderTimer = rand(0.4, 1.2);
+        const a = rand(0, Math.PI * 2);
+        this.wanderDir = { x: Math.cos(a), y: Math.sin(a) };
+      }
+      this.tryMove(this.x + this.wanderDir.x * this.speed * 0.35 * dt, this.y + this.wanderDir.y * this.speed * 0.35 * dt, obstacles);
+      this.facing = this.wanderDir;
+    }
+    this.hopT += dt * 12;
+  }
+  draw(ctx, camX, camY) {
+    const sx = this.x - camX, sy = this.y - camY;
+    const hop = Math.abs(Math.sin(this.hopT)) * (this.fleeing ? 5 : 2);
+    ctx.save();
+    ctx.translate(sx, sy - hop);
+    const angle = Math.atan2(this.facing.y || 1, this.facing.x || 0);
+    ctx.rotate(angle + Math.PI / 2);
+    // body (rat-brown coat, same palette as rats — only the silhouette differs)
+    ctx.fillStyle = '#8a6f54';
+    ctx.beginPath();
+    ctx.ellipse(0, 3, 8, 11, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // head
+    ctx.beginPath();
+    ctx.ellipse(0, -9, 6, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // long ears
+    ctx.fillStyle = '#6e573f';
+    ctx.beginPath(); ctx.ellipse(-4, -18, 2.5, 9, -0.15, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(4, -18, 2.5, 9, 0.15, 0, Math.PI * 2); ctx.fill();
+    // eye
+    ctx.fillStyle = '#1a1a1a';
+    ctx.beginPath(); ctx.arc(0, -10, 1.2, 0, Math.PI * 2); ctx.fill();
+    // tail
+    ctx.fillStyle = '#5c4738';
+    ctx.beginPath(); ctx.arc(0, 13, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ---------- Game ----------
+class Game {
+  constructor() {
+    this.level = 1;
+    this.score = 0;
+    this.highScore = 0;
+    this.state = 'menu'; // menu | playing | won | lost
+    this.lastTime = 0;
+    this.floatTexts = [];
+    requestAnimationFrame(t => this.loop(t));
+  }
+
+  startLevel() {
+    this.dog = new Dog(WORLD_W / 2, WORLD_H / 2);
+    this.obstacles = this.buildObstacles();
+    // safety net: nudge the dog free if it somehow still spawns overlapping
+    // an obstacle, so movement can never be permanently blocked
+    let guard = 0;
+    while (this.dog.collidesAt(this.dog.x, this.dog.y, this.obstacles) && guard < 60) {
+      this.dog.x = WORLD_W / 2 + rand(-200, 200);
+      this.dog.y = WORLD_H / 2 + rand(-200, 200);
+      guard++;
+    }
+    const ratCount = clamp(8 + this.level - 1, 8, 14);
+    const rabbitCount = clamp(6 + Math.floor((this.level - 1) / 1), 6, 10);
+    this.rats = [];
+    this.rabbits = [];
+    for (let i = 0; i < ratCount; i++) {
+      const isBig = Math.random() < 0.3;
+      this.rats.push(new Rat(...this.spawnPoint(), isBig));
+    }
+    for (let i = 0; i < rabbitCount; i++) this.rabbits.push(new Rabbit(...this.spawnPoint()));
+    this.ratSpeedMult = 1 + (this.level - 1) * 0.08;
+    this.timeLeft = Math.max(45, 90 - (this.level - 1) * 8);
+    this.totalTime = this.timeLeft;
+    this.catchCooldown = 0;
+    this.ratsCaught = 0;
+    this.ratsTotal = ratCount;
+    this.floatTexts = [];
+    this.state = 'playing';
+  }
+
+  spawnPoint() {
+    let x, y, tries = 0;
+    do {
+      x = rand(60, WORLD_W - 60);
+      y = rand(60, WORLD_H - 60);
+      tries++;
+    } while (tries < 30 && (this.obstacles.some(o => o.intersects(x, y, 14)) || dist(x, y, WORLD_W / 2, WORLD_H / 2) < 150));
+    return [x, y];
+  }
+
+  buildObstacles() {
+    const obs = [];
+    // keep a clear landing zone around the dog's spawn point at the
+    // world center so it can never start wedged inside an obstacle
+    const spawnClearR = 160;
+    const farFromSpawn = (x, y, w, h) => {
+      const closestX = clamp(WORLD_W / 2, x, x + w);
+      const closestY = clamp(WORLD_H / 2, y, y + h);
+      return dist(WORLD_W / 2, WORLD_H / 2, closestX, closestY) >= spawnClearR;
+    };
+    const place = (w, h, minX, maxX, minY, maxY) => {
+      let x, y, tries = 0;
+      do {
+        x = rand(minX, maxX);
+        y = rand(minY, maxY);
+        tries++;
+      } while (tries < 20 && !farFromSpawn(x, y, w, h));
+      return farFromSpawn(x, y, w, h) ? { x, y } : null;
+    };
+
+    // border fences
+    obs.push(new Obstacle(0, 0, WORLD_W, 20, 'fence'));
+    obs.push(new Obstacle(0, WORLD_H - 20, WORLD_W, 20, 'fence'));
+    obs.push(new Obstacle(0, 0, 20, WORLD_H, 'fence'));
+    obs.push(new Obstacle(WORLD_W - 20, 0, 20, WORLD_H, 'fence'));
+
+    // scattered hay bales
+    for (let i = 0; i < 24; i++) {
+      const p = place(60, 60, 80, WORLD_W - 140, 80, WORLD_H - 140);
+      if (p) obs.push(new Obstacle(p.x, p.y, 60, 60, 'hay'));
+    }
+    // crates
+    for (let i = 0; i < 16; i++) {
+      const p = place(40, 40, 80, WORLD_W - 110, 80, WORLD_H - 110);
+      if (p) obs.push(new Obstacle(p.x, p.y, 40, 40, 'crate'));
+    }
+    // stalls (bigger structures with walls)
+    for (let i = 0; i < 6; i++) {
+      const p = place(180, 160, 100, WORLD_W - 260, 100, WORLD_H - 220);
+      if (!p) continue;
+      const { x, y } = p;
+      obs.push(new Obstacle(x, y, 180, 16, 'stall'));
+      obs.push(new Obstacle(x, y, 16, 160, 'stall'));
+      obs.push(new Obstacle(x + 180, y, 16, 160, 'stall'));
+    }
+    return obs;
+  }
+
+  addFloatText(x, y, text, color) {
+    this.floatTexts.push(new FloatText(x, y, text, color));
+  }
+
+  catchCheck() {
+    if (this.catchCooldown > 0) return;
+    const dog = this.dog;
+    for (let i = this.rats.length - 1; i >= 0; i--) {
+      const r = this.rats[i];
+      if (dist(dog.x, dog.y, r.x, r.y) < dog.r + r.r) {
+        this.rats.splice(i, 1);
+        this.score += 100;
+        this.ratsCaught++;
+        this.addFloatText(r.x, r.y, '+100', '#5fd35f');
+        AudioFX.bark();
+        this.catchCooldown = 0.25;
+        if (this.rats.length === 0) this.win();
+        return;
+      }
+    }
+    for (let i = this.rabbits.length - 1; i >= 0; i--) {
+      const rb = this.rabbits[i];
+      if (dist(dog.x, dog.y, rb.x, rb.y) < dog.r + rb.r) {
+        this.score -= 150;
+        this.addFloatText(rb.x, rb.y, '-150', '#e05050');
+        AudioFX.whine();
+        dog.applyPenalty();
+        this.catchCooldown = 0.25;
+        // respawn elsewhere instead of removing -> keeps risk present
+        const [nx, ny] = this.spawnPoint();
+        rb.x = nx; rb.y = ny; rb.fleeing = false;
+        return;
+      }
+    }
+  }
+
+  win() {
+    this.state = 'won';
+    const bonus = Math.round(this.timeLeft * 5);
+    this.score += bonus;
+    this.lastBonus = bonus;
+    if (this.score > this.highScore) this.highScore = this.score;
+    AudioFX.win();
+    this.showOverlay();
+  }
+
+  lose() {
+    this.state = 'lost';
+    if (this.score > this.highScore) this.highScore = this.score;
+    AudioFX.lose();
+    this.showOverlay();
+  }
+
+  showOverlay() {
+    if (this.state === 'won') {
+      overlayText.innerHTML = `
+        <div class="stat">🎉 Level ${this.level} Complete! 🎉</div>
+        <div class="stat">Time bonus: <b>+${this.lastBonus}</b></div>
+        <div class="stat">Score: <b>${this.score}</b></div>
+        <div class="stat">High score: <b>${this.highScore}</b></div>`;
+      startBtn.textContent = 'Next Level';
+    } else if (this.state === 'lost') {
+      overlayText.innerHTML = `
+        <div class="stat">⏰ Time's up!</div>
+        <div class="stat">Rats caught: <b>${this.ratsCaught} / ${this.ratsTotal}</b></div>
+        <div class="stat">Score: <b>${this.score}</b></div>
+        <div class="stat">High score: <b>${this.highScore}</b></div>`;
+      startBtn.textContent = 'Try Again';
+    }
+    overlay.classList.remove('hidden');
+  }
+
+  update(dt) {
+    if (this.state !== 'playing') return;
+    this.timeLeft -= dt;
+    if (this.timeLeft <= 0) { this.timeLeft = 0; this.lose(); return; }
+
+    this.dog.update(dt, this.obstacles);
+    for (const r of this.rats) { r.speed = r.speed; r.update(dt * this.ratSpeedMult, this.dog, this.obstacles); }
+    for (const rb of this.rabbits) rb.update(dt, this.dog, this.obstacles);
+
+    if (this.catchCooldown > 0) this.catchCooldown -= dt;
+    this.catchCheck();
+
+    for (let i = this.floatTexts.length - 1; i >= 0; i--) {
+      this.floatTexts[i].update(dt);
+      if (this.floatTexts[i].life <= 0) this.floatTexts.splice(i, 1);
+    }
+  }
+
+  draw() {
+    if (this.state !== 'playing') return;
+    const camX = clamp(this.dog.x - VIEW_W / 2, 0, WORLD_W - VIEW_W);
+    const camY = clamp(this.dog.y - VIEW_H / 2, 0, WORLD_H - VIEW_H);
+
+    // render the world at low resolution into pixelCtx; everything drawn
+    // here gets chunky-pixelated once it's scaled back up below
+    pixelCtx.save();
+    pixelCtx.scale(1 / PIXEL_SCALE, 1 / PIXEL_SCALE);
+
+    // floor
+    pixelCtx.fillStyle = '#6b4a2c';
+    pixelCtx.fillRect(0, 0, VIEW_W, VIEW_H);
+    pixelCtx.strokeStyle = 'rgba(0,0,0,0.12)';
+    pixelCtx.lineWidth = 1;
+    const plankW = 64;
+    for (let x = -((camX) % plankW); x < VIEW_W; x += plankW) {
+      pixelCtx.beginPath(); pixelCtx.moveTo(x, 0); pixelCtx.lineTo(x, VIEW_H); pixelCtx.stroke();
+    }
+    for (let y = -((camY) % plankW); y < VIEW_H; y += plankW) {
+      pixelCtx.beginPath(); pixelCtx.moveTo(0, y); pixelCtx.lineTo(VIEW_W, y); pixelCtx.stroke();
+    }
+
+    // obstacles
+    for (const o of this.obstacles) {
+      if (o.x + o.w < camX || o.x > camX + VIEW_W || o.y + o.h < camY || o.y > camY + VIEW_H) continue;
+      pixelCtx.save(); pixelCtx.translate(-camX, -camY); o.draw(pixelCtx); pixelCtx.restore();
+    }
+
+    // entities
+    for (const r of this.rats) r.draw(pixelCtx, camX, camY);
+    for (const rb of this.rabbits) rb.draw(pixelCtx, camX, camY);
+    this.dog.draw(pixelCtx, camX, camY);
+
+    for (const ft of this.floatTexts) ft.draw(pixelCtx, camX, camY);
+
+    pixelCtx.restore();
+
+    // blit the low-res world up to full size with smoothing off -> pixel art look
+    ctx.clearRect(0, 0, VIEW_W, VIEW_H);
+    ctx.drawImage(pixelCanvas, 0, 0, VIEW_W, VIEW_H);
+
+    // HUD is drawn at full resolution on top so text stays crisp/readable
+    this.drawHUD();
+  }
+
+  drawHUD() {
+    ctx.save();
+    ctx.font = 'bold 20px Trebuchet MS';
+    ctx.textBaseline = 'top';
+
+    // score - top left
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#fff5e1';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 3;
+    ctx.strokeText(`Score: ${this.score}`, 14, 12);
+    ctx.fillText(`Score: ${this.score}`, 14, 12);
+
+    // rats remaining - top center
+    const ratsLeft = this.rats.length;
+    const label = `🐭 Rats left: ${ratsLeft}`;
+    ctx.textAlign = 'center';
+    ctx.strokeText(label, VIEW_W / 2, 12);
+    ctx.fillText(label, VIEW_W / 2, 12);
+
+    // timer - top right
+    const t = Math.ceil(this.timeLeft);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = t <= 10 ? '#ff6b6b' : '#fff5e1';
+    const timeLabel = `⏱ ${t}s`;
+    ctx.strokeText(timeLabel, VIEW_W - 14, 12);
+    ctx.fillText(timeLabel, VIEW_W - 14, 12);
+
+    // level - below timer
+    ctx.font = 'bold 14px Trebuchet MS';
+    ctx.fillStyle = '#ffcf6e';
+    ctx.strokeText(`Level ${this.level}`, VIEW_W - 14, 38);
+    ctx.fillText(`Level ${this.level}`, VIEW_W - 14, 38);
+
+    ctx.restore();
+  }
+
+  loop(time) {
+    const dt = Math.min((time - this.lastTime) / 1000 || 0, 0.05);
+    this.lastTime = time;
+    this.update(dt);
+    this.draw();
+    requestAnimationFrame(t => this.loop(t));
+  }
+}
+
+const game = new Game();
+
+startBtn.addEventListener('click', () => {
+  if (game.state === 'menu') {
+    game.level = 1;
+    game.score = 0;
+  } else if (game.state === 'won') {
+    game.level++;
+  } else if (game.state === 'lost') {
+    game.level = 1;
+    game.score = 0;
+  }
+  game.startLevel();
+  overlay.classList.add('hidden');
+  AudioFX.init();
+});
+</script>
+</body>
+</html>
