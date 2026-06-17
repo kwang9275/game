@@ -5,7 +5,7 @@
 <title>Barn Ratter</title>
 <style>
   html, body {
-    margin: 0; padding: 0; background: #2b1d12; overflow: hidden;
+    margin: 0; padding: 0; background: #1a3312; overflow: hidden;
     font-family: 'Trebuchet MS', Verdana, sans-serif; color: #fff5e1;
     height: 100%; display: flex; align-items: center; justify-content: center;
     touch-action: none;
@@ -18,7 +18,7 @@
   }
   canvas {
     display: block; width: 100%; height: 100%;
-    background: #5a3d24; image-rendering: pixelated;
+    background: #4a8c35; image-rendering: pixelated;
     touch-action: none;
   }
   #overlay {
@@ -313,19 +313,33 @@ class Obstacle {
       ctx.strokeRect(x + 3, y + 3, w - 6, h - 6);
       ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + w, y + h); ctx.moveTo(x + w, y); ctx.lineTo(x, y + h); ctx.stroke();
     } else if (type === 'fence') {
-      ctx.fillStyle = '#6b4326';
+      // hedgerow border
+      ctx.fillStyle = '#2a5c1a';
       ctx.fillRect(x, y, w, h);
-      ctx.fillStyle = '#8a5a32';
-      const postW = 6;
-      for (let i = 0; i < w; i += 18) ctx.fillRect(x + i, y, postW, h);
-    } else if (type === 'stall') {
-      ctx.fillStyle = '#7a4a26';
-      ctx.fillRect(x, y, w, h);
-      ctx.strokeStyle = '#3e2510';
-      ctx.lineWidth = 4;
+      ctx.fillStyle = '#1e4412';
+      const bushW = 16;
+      for (let i = 0; i <= w - bushW; i += bushW) {
+        ctx.fillRect(x + i + 2, y + 2, bushW - 4, h - 4);
+      }
+      ctx.strokeStyle = '#162e0d';
+      ctx.lineWidth = 2;
       ctx.strokeRect(x, y, w, h);
-      ctx.fillStyle = '#3e2510';
-      ctx.fillRect(x + w / 2 - 4, y, 8, h);
+    } else if (type === 'stall') {
+      // stone wall
+      ctx.fillStyle = '#8a8070';
+      ctx.fillRect(x, y, w, h);
+      ctx.strokeStyle = '#5a5048';
+      ctx.lineWidth = 1;
+      const bH = 8, bW = 20;
+      for (let row = 0; row * bH < h; row++) {
+        const offset = (row % 2) * (bW / 2);
+        for (let col = -bW; col < w + bW; col += bW) {
+          ctx.strokeRect(x + col + offset, y + row * bH, bW, bH);
+        }
+      }
+      ctx.strokeStyle = '#3a3028';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(x, y, w, h);
     }
   }
 }
@@ -960,17 +974,13 @@ class Game {
     pixelCtx.save();
     pixelCtx.scale(1 / PIXEL_SCALE, 1 / PIXEL_SCALE);
 
-    // floor
-    pixelCtx.fillStyle = '#6b4a2c';
-    pixelCtx.fillRect(0, 0, VIEW_W, VIEW_H);
-    pixelCtx.strokeStyle = 'rgba(0,0,0,0.12)';
-    pixelCtx.lineWidth = 1;
-    const plankW = 64;
-    for (let x = -((camX) % plankW); x < VIEW_W; x += plankW) {
-      pixelCtx.beginPath(); pixelCtx.moveTo(x, 0); pixelCtx.lineTo(x, VIEW_H); pixelCtx.stroke();
-    }
-    for (let y = -((camY) % plankW); y < VIEW_H; y += plankW) {
-      pixelCtx.beginPath(); pixelCtx.moveTo(0, y); pixelCtx.lineTo(VIEW_W, y); pixelCtx.stroke();
+    // grass field — alternating mown stripes scrolling with the camera
+    const stripeH = 48;
+    const stripeOffset = camY % (stripeH * 2);
+    for (let y = -stripeOffset; y < VIEW_H; y += stripeH) {
+      const stripe = Math.floor((y + stripeOffset) / stripeH);
+      pixelCtx.fillStyle = stripe % 2 === 0 ? '#4a8c35' : '#3f7a2c';
+      pixelCtx.fillRect(0, y, VIEW_W, stripeH);
     }
 
     // obstacles
