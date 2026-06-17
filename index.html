@@ -37,6 +37,24 @@
   #overlay button:hover { background: #d35a38; }
   .stat { font-size: 20px; margin: 4px 0; }
   .stat b { color: #ffcf6e; }
+  #initialsSection { margin-top: 14px; }
+  #initialsInput {
+    font-size: 30px; font-weight: bold; text-transform: uppercase; letter-spacing: 10px;
+    width: 110px; text-align: center; background: #3a2010; color: #ffcf6e;
+    border: 3px solid #ffcf6e; border-radius: 6px; padding: 4px 8px;
+    font-family: 'Trebuchet MS', Verdana, sans-serif;
+  }
+  #saveScoreBtn {
+    margin-left: 10px; padding: 8px 18px; font-size: 16px; cursor: pointer;
+    background: #2a6e2a; color: #fff5e1; border: 2px solid #5fd35f; border-radius: 6px;
+    font-weight: bold;
+  }
+  #saveScoreBtn:hover { background: #3a8e3a; }
+  .lb-table { margin: 10px auto 0; border-collapse: collapse; font-size: 16px; }
+  .lb-table td { padding: 2px 18px; }
+  .lb-table td:first-child { color: #aaa; }
+  .lb-table td:nth-child(2) { color: #ffcf6e; font-weight: bold; letter-spacing: 3px; }
+  .lb-table td:nth-child(3) { color: #fff5e1; text-align: right; }
 </style>
 </head>
 <body>
@@ -50,6 +68,12 @@
       <b>WASD / Arrow Keys</b> to move. Bump into rats to catch them (+100).<br>
       <b>Avoid rabbits</b> — catching one costs you points (-150) and slows you down!
     </p>
+    <div id="initialsSection" style="display:none">
+      <div style="font-size:18px;margin-bottom:8px">🏆 New high score! Enter your initials:</div>
+      <input id="initialsInput" maxlength="3" placeholder="AAA" autocomplete="off">
+      <button id="saveScoreBtn">Save</button>
+    </div>
+    <div id="leaderboardDiv"></div>
     <button id="startBtn">Start Game</button>
   </div>
 </div>
@@ -114,10 +138,11 @@ const AudioFX = {
     this.tone(420, 0.09, 'square', 0.28, 180);
     setTimeout(() => this.tone(380, 0.1, 'square', 0.26, 150), 90);
   },
-  happyBark() {
-    // bright, rising woof-woof for a successful rat catch
-    this.tone(520, 0.1, 'square', 0.3, 760);
-    setTimeout(() => this.tone(600, 0.12, 'square', 0.28, 900), 90);
+  happyBark(combo = 1) {
+    // pitch rises with combo so you can hear the streak climbing
+    const boost = Math.min(combo - 1, 6) * 60;
+    this.tone(520 + boost, 0.1, 'square', 0.3, 760 + boost);
+    setTimeout(() => this.tone(600 + boost, 0.12, 'square', 0.28, 900 + boost), 90);
   },
   sadBark() {
     // low, drooping woof for an accidental rabbit catch
@@ -487,6 +512,8 @@ const RAT_SIZES = [
   { scale: 1.1, r: 9, speed: [80, 110] },
   { scale: 1.5, r: 13, speed: [65, 95] }
 ];
+// small rats are fastest and worth most; big rats are slow and worth least
+const RAT_POINTS = [150, 100, 75];
 const RAT_COLORS = {
   white: { body: '#e8e2d0', head: '#e8e2d0', ear: '#cfc6ad' },
   grey:  { body: '#8a8580', head: '#8a8580', ear: '#6e6a66' },
@@ -639,6 +666,36 @@ class Rabbit extends Entity {
   }
 }
 
+// ---------- Leaderboard (localStorage, top 5) ----------
+const Leaderboard = {
+  key: 'barnRatterLB',
+  load() {
+    try { return JSON.parse(localStorage.getItem(this.key)) || []; } catch { return []; }
+  },
+  save(entries) {
+    try { localStorage.setItem(this.key, JSON.stringify(entries)); } catch {}
+  },
+  add(name, score) {
+    const entries = this.load();
+    entries.push({ name: (name || '???').toUpperCase().slice(0, 3).padEnd(3, ' '), score });
+    entries.sort((a, b) => b.score - a.score);
+    entries.splice(5);
+    this.save(entries);
+    return entries;
+  },
+  qualifies(score) {
+    const entries = this.load();
+    return entries.length < 5 || score > (entries[entries.length - 1]?.score ?? -Infinity);
+  },
+  renderHTML() {
+    const entries = this.load();
+    if (!entries.length) return '';
+    const rows = entries.map((e, i) =>
+      `<tr><td>#${i+1}</td><td>${e.name}</td><td>${e.score}</td></tr>`).join('');
+    return `<table class="lb-table"><tr><td colspan="3" style="color:#ffcf6e;font-weight:bold;padding-bottom:4px">🏅 High Scores</td></tr>${rows}</table>`;
+  }
+};
+
 // ---------- Game ----------
 class Game {
   constructor() {
@@ -648,6 +705,9 @@ class Game {
     this.state = 'menu'; // menu | playing | won | lost
     this.lastTime = 0;
     this.floatTexts = [];
+    this.combo = 0;
+    this.comboTimer = 0;
+    this.comboBanner = null; // { text, color, life }
     requestAnimationFrame(t => this.loop(t));
   }
 
@@ -681,6 +741,9 @@ class Game {
     this.ratsCaught = 0;
     this.ratsTotal = ratCount;
     this.floatTexts = [];
+    this.combo = 0;
+    this.comboTimer = 0;
+    this.comboBanner = null;
     this.state = 'playing';
   }
 
@@ -749,28 +812,52 @@ class Game {
   catchCheck() {
     if (this.catchCooldown > 0) return;
     const dog = this.dog;
+    const urgent = this.timeLeft <= 10; // double points in last 10 s
+
     for (let i = this.rats.length - 1; i >= 0; i--) {
       const r = this.rats[i];
       if (dist(dog.x, dog.y, r.x, r.y) < dog.r + r.r) {
         this.rats.splice(i, 1);
-        this.score += 100;
         this.ratsCaught++;
-        this.addFloatText(r.x, r.y, '+100', '#5fd35f');
-        AudioFX.happyBark();
+        this.combo++;
+        this.comboTimer = 3.0;
+
+        let pts = RAT_POINTS[r.sizeIdx] * this.combo;
+        if (urgent) pts *= 2;
+        this.score += pts;
+
+        const ptsLabel = (urgent ? '⚡' : '') + '+' + pts;
+        this.addFloatText(r.x, r.y, ptsLabel, urgent ? '#ffe44d' : '#5fd35f');
+        AudioFX.happyBark(this.combo);
+
+        if (this.combo >= 2) {
+          const colors = ['#fff5e1','#ffcf6e','#ff9a3c','#ff5c5c','#e040fb'];
+          this.comboBanner = {
+            text: `x${this.combo} GOOD BOY!`,
+            color: colors[Math.min(this.combo - 2, colors.length - 1)],
+            life: 1.8
+          };
+        }
+
         this.catchCooldown = 0.25;
         if (this.rats.length === 0) this.win();
         return;
       }
     }
+
     for (let i = this.rabbits.length - 1; i >= 0; i--) {
       const rb = this.rabbits[i];
       if (dist(dog.x, dog.y, rb.x, rb.y) < dog.r + rb.r) {
-        this.score -= 150;
-        this.addFloatText(rb.x, rb.y, '-150', '#e05050');
+        // penalty scales with active combo (more to lose = more tension)
+        const penalty = 150 + Math.max(0, this.combo - 1) * 50;
+        this.score -= penalty;
+        this.combo = 0;
+        this.comboTimer = 0;
+        this.comboBanner = null;
+        this.addFloatText(rb.x, rb.y, '-' + penalty, '#e05050');
         AudioFX.sadBark();
         dog.applyPenalty();
         this.catchCooldown = 0.25;
-        // respawn elsewhere instead of removing -> keeps risk present
         const [nx, ny] = this.spawnPoint();
         rb.x = nx; rb.y = ny; rb.fleeing = false;
         return;
@@ -784,8 +871,10 @@ class Game {
     this.score += bonus;
     this.lastBonus = bonus;
     if (this.score > this.highScore) this.highScore = this.score;
+    // dramatic centre splash for the time bonus
+    this.addFloatText(WORLD_W / 2, WORLD_H / 2, `TIME BONUS +${bonus}!`, '#ffe44d');
     AudioFX.win();
-    this.showOverlay();
+    setTimeout(() => this.showOverlay(), 800);
   }
 
   lose() {
@@ -796,21 +885,40 @@ class Game {
   }
 
   showOverlay() {
+    const initSec = document.getElementById('initialsSection');
+    const lbDiv   = document.getElementById('leaderboardDiv');
+    initSec.style.display = 'none';
+
     if (this.state === 'won') {
       overlayText.innerHTML = `
         <div class="stat">🎉 Level ${this.level} Complete! 🎉</div>
         <div class="stat">Time bonus: <b>+${this.lastBonus}</b></div>
-        <div class="stat">Score: <b>${this.score}</b></div>
-        <div class="stat">High score: <b>${this.highScore}</b></div>`;
+        <div class="stat">Score: <b>${this.score}</b></div>`;
       startBtn.textContent = 'Next Level';
     } else if (this.state === 'lost') {
       overlayText.innerHTML = `
         <div class="stat">⏰ Time's up!</div>
         <div class="stat">Rats caught: <b>${this.ratsCaught} / ${this.ratsTotal}</b></div>
-        <div class="stat">Score: <b>${this.score}</b></div>
-        <div class="stat">High score: <b>${this.highScore}</b></div>`;
+        <div class="stat">Score: <b>${this.score}</b></div>`;
       startBtn.textContent = 'Try Again';
+    } else {
+      // menu
+      overlayText.innerHTML = `
+        You are a Wire Fox Terrier on rat patrol! Explore the barn, sniff out every rat,
+        and catch them all before time runs out.<br><br>
+        <b>WASD / Arrow Keys / Touch</b> to move. Bump into rats to catch them.<br>
+        <b>Avoid rabbits</b> — catching one costs points and slows you down!<br>
+        Build a <b>combo streak</b> to multiply your score — small rats are worth the most!`;
     }
+
+    if (this.state !== 'menu' && Leaderboard.qualifies(this.score)) {
+      initSec.style.display = 'block';
+      document.getElementById('initialsInput').value = '';
+      document.getElementById('initialsInput').focus();
+    } else {
+      lbDiv.innerHTML = Leaderboard.renderHTML();
+    }
+
     overlay.classList.remove('hidden');
   }
 
@@ -825,6 +933,16 @@ class Game {
 
     if (this.catchCooldown > 0) this.catchCooldown -= dt;
     this.catchCheck();
+
+    // combo expires if no rat caught within window
+    if (this.combo > 0) {
+      this.comboTimer -= dt;
+      if (this.comboTimer <= 0) { this.combo = 0; this.comboBanner = null; }
+    }
+    if (this.comboBanner) {
+      this.comboBanner.life -= dt;
+      if (this.comboBanner.life <= 0) this.comboBanner = null;
+    }
 
     for (let i = this.floatTexts.length - 1; i >= 0; i--) {
       this.floatTexts[i].update(dt);
@@ -915,6 +1033,35 @@ class Game {
     ctx.strokeText(`Level ${this.level}`, VIEW_W - 14, 38);
     ctx.fillText(`Level ${this.level}`, VIEW_W - 14, 38);
 
+    // combo banner - centered, fades out
+    if (this.comboBanner) {
+      const b = this.comboBanner;
+      const alpha = clamp(b.life, 0, 1);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.font = `bold ${28 + Math.min(this.combo, 8) * 2}px Trebuchet MS`;
+      ctx.textAlign = 'center';
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = '#000';
+      ctx.fillStyle = b.color;
+      ctx.strokeText(b.text, VIEW_W / 2, VIEW_H / 2 - 60);
+      ctx.fillText(b.text, VIEW_W / 2, VIEW_H / 2 - 60);
+      ctx.restore();
+    }
+
+    // urgent flash when ≤10 s
+    if (Math.ceil(this.timeLeft) <= 10 && Math.floor(this.timeLeft * 4) % 2 === 0) {
+      ctx.save();
+      ctx.font = 'bold 15px Trebuchet MS';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#ff6b6b';
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 3;
+      ctx.strokeText('⚡ DOUBLE POINTS ⚡', VIEW_W / 2, 38);
+      ctx.fillText('⚡ DOUBLE POINTS ⚡', VIEW_W / 2, 38);
+      ctx.restore();
+    }
+
     ctx.restore();
   }
 
@@ -928,6 +1075,9 @@ class Game {
 }
 
 const game = new Game();
+
+// Show leaderboard on the title screen
+document.getElementById('leaderboardDiv').innerHTML = Leaderboard.renderHTML();
 
 startBtn.addEventListener('click', () => {
   if (game.state === 'menu') {
@@ -943,6 +1093,17 @@ startBtn.addEventListener('click', () => {
   overlay.classList.add('hidden');
   AudioFX.init();
   AudioFX.startMusic();
+});
+
+document.getElementById('saveScoreBtn').addEventListener('click', () => {
+  const name = document.getElementById('initialsInput').value.trim() || '???';
+  Leaderboard.add(name, game.score);
+  document.getElementById('initialsSection').style.display = 'none';
+  document.getElementById('leaderboardDiv').innerHTML = Leaderboard.renderHTML();
+});
+
+document.getElementById('initialsInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('saveScoreBtn').click();
 });
 </script>
 </body>
